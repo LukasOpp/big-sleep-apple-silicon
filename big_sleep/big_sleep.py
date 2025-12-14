@@ -46,7 +46,14 @@ def get_device(device_str='auto'):
     
     Returns:
         torch.device: The selected device
+    
+    Raises:
+        ValueError: If device_str is not one of the supported values
     """
+    supported_devices = {'auto', 'mps', 'cuda', 'cpu'}
+    if device_str not in supported_devices:
+        raise ValueError(f"device must be one of {supported_devices}, got '{device_str}'")
+    
     if device_str == 'auto':
         if torch.backends.mps.is_available():
             return torch.device('mps')
