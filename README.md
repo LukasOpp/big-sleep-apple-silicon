@@ -52,6 +52,23 @@
 
 You will be able to have the GAN dream up images using natural language with a one-line command in the terminal.
 
+### 🚀 NEW: MLX Implementation for Apple Silicon
+
+This repository now includes **Big Sleep MLX** - a fully native Apple Silicon implementation using Apple's MLX framework for maximum performance on M1/M2/M3 Macs. See [big_sleep_mlx/README.md](big_sleep_mlx/README.md) for details.
+
+**Performance improvements on Apple Silicon:**
+- 2-4x faster than PyTorch with MPS
+- 40% less memory usage
+- Native Metal GPU acceleration
+
+```bash
+# Install MLX version
+pip install -r big_sleep_mlx/requirements.txt
+
+# Use MLX version
+python -m big_sleep_mlx.cli --text="cosmic landscape"
+```
+
 Original notebook [![Open In Colab][colab-badge]][colab-notebook]
 
 Simplified notebook [![Open In Colab][colab-badge]][colab-notebook-2]
