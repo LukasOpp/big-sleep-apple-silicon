@@ -9,6 +9,16 @@
 #   bash -c "curl -fsSL https://raw.githubusercontent.com/LukasOpp/big-sleep-apple-silicon/main/runpod/run.sh -o /workspace/run.sh && bash /workspace/run.sh"
 # Give the pod a volume disk (/workspace) of ~20 GB so a restarted pod resumes instead of starting over.
 #
+# Or from the pod's web terminal (survives closing the tab; runs unattended):
+#   export RCLONE_CONFIG_DEST_TYPE=drive
+#   export RCLONE_CONFIG_DEST_TOKEN='{"access_token":...}'     <- SINGLE quotes, or the JSON breaks
+#   nohup bash /workspace/run.sh > /dev/null 2>&1 &
+#   tail -f /workspace/run_*.log
+# Running it in the foreground of a terminal is "interactive": it never deletes the pod
+# because of a setup error, only after a finished run.
+#
+# Tip: store the token as a RunPod Secret and set the env var to {{ RUNPOD_SECRET_<name> }}.
+#
 # Pod environment variables:
 #   RCLONE_CONFIG_DEST_TYPE   e.g. dropbox or drive          (required)
 #   RCLONE_CONFIG_DEST_TOKEN  the token JSON from `rclone authorize dropbox` on your Mac  (required)
@@ -25,6 +35,7 @@ COUNT="${COUNT:-1000}"
 WORKERS="${WORKERS:-2}"
 MAX_HOURS="${MAX_HOURS:-30}"
 POD="${RUNPOD_POD_ID:-unknown}"
+INTERACTIVE=0; [ -t 0 ] && INTERACTIVE=1
 mkdir -p /workspace
 # Persist run id + seed so a restarted container resumes the same run.
 [ -f /workspace/.run_id ] || { date -u +%Y-%m-%d_%H%M > /workspace/.run_id; echo "${RUN_SEED:-$RANDOM$RANDOM}" > /workspace/.run_seed; }
@@ -60,9 +71,20 @@ terminate_pod() {
 }
 
 FINISHED=0
+GENERATING=0
 finish() {
   [ "$FINISHED" = 1 ] && return; FINISHED=1
-  kill "${UPLOADER_PID:-}" 2>/dev/null
+  if [ "$GENERATING" = 0 ]; then
+    # Failed during setup: nothing was made, so there's nothing to upload or protect.
+    if [ "$INTERACTIVE" = 1 ]; then
+      echo "Setup failed (see above). Pod left running; fix it and re-run."
+    else
+      notify "Setup failed on pod $POD (see log). Terminating so it doesn't bill idle."
+      terminate_pod remove
+    fi
+    return
+  fi
+  kill "${UPLOADER_PID:-}" "${PROGRESS_PID:-}" 2>/dev/null
   local made; made=$(ls "$OUT"/*.png 2>/dev/null | grep -vc '\.tmp\.png$')
   cp "$LOG" "$OUT/run.log" 2>/dev/null
   local ok=0
@@ -83,11 +105,19 @@ finish() {
 }
 trap finish EXIT INT TERM
 
-[ -n "${RCLONE_CONFIG_DEST_TYPE:-}" ] || { notify "RCLONE_CONFIG_DEST_* not set, nowhere to send images. Aborting."; exit 1; }
-
 if [ -f /workspace/.done ]; then
-  notify "Pod $POD restarted after the run already finished. Terminating."; FINISHED=1; terminate_pod remove; exit 0
+  FINISHED=1
+  if [ "$INTERACTIVE" = 1 ]; then
+    echo "A run already finished on this volume. To start a new one: rm /workspace/.done /workspace/.run_id /workspace/.run_seed"
+    exit 0
+  fi
+  notify "Pod $POD restarted after the run already finished. Terminating."; terminate_pod remove; exit 0
 fi
+
+[ -n "${RCLONE_CONFIG_DEST_TYPE:-}" ] && [ -n "${RCLONE_CONFIG_DEST_TOKEN:-}" ] || {
+  notify "RCLONE_CONFIG_DEST_TYPE / RCLONE_CONFIG_DEST_TOKEN not set (did you 'export' them?). Aborting."; exit 1; }
+python -c 'import json,os; json.loads(os.environ["RCLONE_CONFIG_DEST_TOKEN"])' 2>/dev/null || {
+  notify "RCLONE_CONFIG_DEST_TOKEN isn't valid JSON. In a shell, wrap it in single quotes: export RCLONE_CONFIG_DEST_TOKEN='{...}'"; exit 1; }
 notify "Pod $POD starting: $COUNT images, $WORKERS workers, run seed $RUN_SEED."
 
 # ---- setup -------------------------------------------------------------------
@@ -106,6 +136,7 @@ rclone mkdir "$DEST" && echo "run seed $RUN_SEED, count $COUNT" | rclone rcat "$
   || { notify "Can't write to cloud folder (check rclone token). Aborting."; exit 1; }
 
 # ---- generate ----------------------------------------------------------------
+GENERATING=1
 ( while sleep 180; do upload; done ) & UPLOADER_PID=$!
 ( while sleep 7200; do
     n=$(ls "$OUT"/*.png 2>/dev/null | grep -vc '\.tmp\.png$'); notify "progress: $n/$COUNT"
