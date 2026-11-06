@@ -24,6 +24,15 @@
 #   RCLONE_CONFIG_DEST_TOKEN  the token JSON from `rclone authorize dropbox` on your Mac  (required)
 #   NTFY_TOPIC     ntfy.sh topic to get push notifications on your phone (optional, recommended)
 #   COUNT          images to make                    (default 1000)
+#   MANIFEST       one image per <img> tag: a path in the cloud remote (e.g. big-sleep/manifest.json,
+#                  made by extract_img_manifest.py) or an https URL. Overrides COUNT and CANVAS.
+#   SHARD          split one job over several pods: "1/3" on the first pod, "2/3" on the second, ...
+#                  (use the same MANIFEST and DEST_DIR on all of them)
+#   SCALE          manifest sizes x this (default 1; 2 = retina)
+#   PROMPTS        garbage | alt | mix   (alt = use the tag's alt text when it has one; default garbage)
+#   CANVAS         output size: 1920x1080 | a comma list to pick from per image | random   (default 512x512)
+#   DETAIL         128px cells on the short side before resizing to CANVAS (default 4 = 512px;
+#                  time and VRAM grow with the cell count; use WORKERS=1 for big grids)
 #   WORKERS        parallel jobs on the GPU          (default 2; ~8-10 GB VRAM each)
 #   MAX_HOURS      hard stop no matter what          (default 30)
 #   RUN_SEED       same seed = same prompts/settings (default: random)
@@ -131,8 +140,19 @@ if ! python -c "import torch; (torch.ones(2, device='cuda') @ torch.ones(2, devi
 fi
 pip install -q big-sleep==0.9.1 || { notify "pip install failed"; exit 1; }
 curl -fsSL "$RAW_BASE/generate.py" -o /workspace/generate.py || { notify "could not fetch generate.py"; exit 1; }
+MANIFEST_ARGS=()
+if [ -n "${MANIFEST:-}" ]; then
+  case "$MANIFEST" in
+    http*) curl -fsSL "$MANIFEST" -o /workspace/manifest.json ;;
+    *)     rclone copyto "dest:$MANIFEST" /workspace/manifest.json ;;
+  esac || { notify "could not fetch manifest $MANIFEST"; exit 1; }
+  COUNT=$(python -c 'import json; print(len(json.load(open("/workspace/manifest.json"))))') \
+    || { notify "manifest is not valid JSON"; exit 1; }
+  MANIFEST_ARGS=(--manifest /workspace/manifest.json --scale "${SCALE:-1}")
+  notify "manifest: $COUNT images"
+fi
 export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1   # old checkpoints vs torch>=2.6 defaults
-rclone mkdir "$DEST" && echo "run seed $RUN_SEED, count $COUNT" | rclone rcat "$DEST/_started.txt" \
+rclone mkdir "$DEST" && echo "run seed $RUN_SEED, count $COUNT, canvas ${CANVAS:-512x512}, detail ${DETAIL:-4}" | rclone rcat "$DEST/_started.txt" \
   || { notify "Can't write to cloud folder (check rclone token). Aborting."; exit 1; }
 
 # ---- generate ----------------------------------------------------------------
@@ -142,10 +162,13 @@ GENERATING=1
     n=$(ls "$OUT"/*.png 2>/dev/null | grep -vc '\.tmp\.png$'); notify "progress: $n/$COUNT"
   done ) & PROGRESS_PID=$!
 
+SHARD="${SHARD:-1/1}"; SHARD_K="${SHARD%/*}"; SHARD_N="${SHARD#*/}"
 pids=()
 for ((w = 0; w < WORKERS; w++)); do
   timeout "${MAX_HOURS}h" python -u /workspace/generate.py --count "$COUNT" --out "$OUT" \
-    --worker "$w" --workers "$WORKERS" --run-seed "$RUN_SEED" &
+    --worker "$(( (SHARD_K - 1) * WORKERS + w ))" --workers "$(( SHARD_N * WORKERS ))" --run-seed "$RUN_SEED" \
+    --canvas "${CANVAS:-512x512}" --detail "${DETAIL:-4}" \
+    --prompt-source "${PROMPTS:-garbage}" "${MANIFEST_ARGS[@]}" &
   pids+=($!)
 done
 fail=0
