@@ -220,7 +220,7 @@ def patch_big_sleep():
             if isinstance(layer, GenBlock):
                 x = layer(x, cond[i].unsqueeze(0), 1)
                 if ALPHA["on"] and i - 1 == ALPHA["block"]:  # tap this block for the mask
-                    feat = x[:, [c % x.shape[1] for c in ALPHA["channels"]]]
+                    feat = x
                 i += 1
             else:
                 x = layer(x)
@@ -258,16 +258,20 @@ def patch_big_sleep():
 
 # ------------------------------------------------------------------ alpha ----
 #
-# The mask is a trained neuron's activation map. BigGAN-deep is a stack of 14
-# residual blocks; alpha = 1-2 channels (random signs) of one block's output,
-# picked per image. Deeper in = finer detail:
-#   block 6  -> 1/16 of the output res (32px for 512): big continents
-#   block 8  -> 1/8   (64px):  bold shapes
-#   block 10 -> 1/4  (128px):  shapes with frayed / feathery edges
-# The logit is standardised, upsampled bilinearly (smooth curves, plus the grid
-# character of the feature map), + a learnable offset, through a sigmoid whose
-# hardness is annealed from soft (so the optimiser can move the shape) to a cut
-# at the end. No post-processing: the saved edge is the model's.
+# The mask is how BigGAN itself splits the picture. Take one block's whole
+# feature map (hundreds of channels per pixel) and find its principal direction
+# (PCA): the axis along which the network's own features vary most across the
+# image. Generator features cluster by object/part, so projecting onto it gives
+# a figure/ground split that follows the content, not one arbitrary neuron.
+# The PCA is recomputed every step (no gradient through it), so as the image
+# changes the cut follows; the sign is chosen so the centre is the opaque side
+# (or the other way round for "invert" images: keep the surroundings).
+#   block 8  -> 1/8 of the output res (64px for 512): bold, simplified shapes
+#   block 10 -> 1/4 (128px): follows object outlines
+#   block 12 -> 1/2 (256px): tightest to the content, finest edges
+# The logit is standardised, upsampled bilinearly, + a learnable offset, through
+# a sigmoid whose hardness is annealed from soft (so the optimiser can move the
+# shape) to a cut at the end. No post-processing: the saved edge is the model's.
 #
 # During optimisation CLIP sees the image composited over a fresh random
 # background each step (flat colour / noise / blotches), so only the opaque part
@@ -275,9 +279,9 @@ def patch_big_sleep():
 # Losses keep the opaque area near a target share, push alpha to 0/1, and
 # optionally keep the border clear so the shape floats in the canvas.
 
-ALPHA = {"on": False}  # set per image: block, channels, signs, gain (annealed in render)
+ALPHA = {"on": False}  # set per image: block, pc, invert, gain (annealed in render)
 LAST = {}              # latest rgb / alpha from the forward pass
-ALPHA_BLOCKS = {6: "1/16", 8: "1/8", 10: "1/4"}  # 12 (1/2 res) is too grainy
+ALPHA_BLOCKS = {8: "1/8", 10: "1/4", 12: "1/2"}
 
 
 def random_background(like):
@@ -294,10 +298,24 @@ def random_background(like):
 
 
 def alpha_from_features(feat, bias, size):
+    """feat: (1, C, h, w) block output -> alpha (1, 1, H, W) from its principal direction."""
     import torch
     import torch.nn.functional as F
-    signs = torch.tensor(ALPHA["signs"], device=feat.device, dtype=feat.dtype).view(1, -1, 1, 1)
-    logit = (feat * signs).sum(1, keepdim=True)
+    _, C, h, w = feat.shape
+    X = feat[0].reshape(C, h * w).T.float()          # pixels x channels
+    Xc = X - X.mean(0, keepdim=True)
+    with torch.no_grad():
+        _, _, V = torch.pca_lowrank(Xc.detach(), q=ALPHA["pc"] + 1, center=False)
+        v = V[:, ALPHA["pc"]]
+        proj = (Xc.detach() @ v).view(h, w)
+        # orient: centre opaque (figure), border transparent; flipped for invert
+        bh, bw = max(1, h // 6), max(1, w // 6)
+        centre = proj[h // 4: h - h // 4, w // 4: w - w // 4].mean()
+        border = torch.cat([proj[:bh].flatten(), proj[-bh:].flatten(), proj[:, :bw].flatten(), proj[:, -bw:].flatten()]).mean()
+        sign = 1.0 if centre >= border else -1.0
+        if ALPHA["invert"]:
+            sign = -sign
+    logit = (Xc @ (v * sign)).view(1, 1, h, w)
     logit = (logit - logit.mean()) / (logit.std() + 1e-5)
     logit = F.interpolate(logit, size=size, mode="bilinear", align_corners=False)
     return torch.sigmoid(ALPHA["gain"] * (logit + bias))
@@ -326,14 +344,14 @@ def alpha_gain(s, step, steps):
 
 
 def sample_alpha(rng):
-    k = rng.choice([1, 1, 2])
+    inv = rng.random() < 0.2
     return {
-        "block": rng.choices(list(ALPHA_BLOCKS), weights=[4, 4, 2])[0],
-        "channels": rng.sample(range(4096), k),         # taken modulo the block's channel count
-        "signs": [rng.choice([1, -1]) for _ in range(k)],
-        "gain_end": rng.choice([25.0, 50.0, 100.0]),    # final edge hardness
-        "coverage": round(rng.uniform(0.25, 0.75), 3),  # target opaque share
-        "float": rng.random() < 0.7,                    # keep edges transparent
+        "block": rng.choices(list(ALPHA_BLOCKS), weights=[2, 4, 4])[0],
+        "pc": rng.choices([0, 1, 2], weights=[6, 3, 1])[0],  # 0 = the main split; 1-2 = secondary ones
+        "invert": inv,                                     # keep the surroundings, cut out the middle
+        "gain_end": rng.choice([25.0, 50.0, 100.0]),       # final edge hardness
+        "coverage": round(rng.uniform(0.25, 0.75), 3),     # target opaque share
+        "float": (not inv) and rng.random() < 0.7,         # keep edges transparent
     }
 
 
