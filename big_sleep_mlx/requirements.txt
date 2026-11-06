@@ -1,0 +1,11 @@
+# Big Sleep MLX Requirements
+# For Apple Silicon Macs
+
+mlx>=0.0.5
+mlx-nn>=0.0.1
+numpy>=1.20.0
+Pillow>=8.0.0
+tqdm>=4.50.0
+fire>=0.4.0
+ftfy>=6.0.0
+regex>=2021.0.0

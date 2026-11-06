@@ -23,8 +23,6 @@ from big_sleep.resample import resample
 from big_sleep.biggan import BigGAN
 from big_sleep.clip import load, tokenize
 
-assert torch.cuda.is_available(), 'CUDA must be available in order to use Big Sleep'
-
 # graceful keyboard interrupt
 
 terminate = False
@@ -35,6 +33,36 @@ def signal_handling(signum,frame):
     terminate = True
 
 signal.signal(signal.SIGINT,signal_handling)
+
+# device detection
+
+def get_device(device_str='auto'):
+    """
+    Get the best available device for PyTorch operations.
+    
+    Args:
+        device_str: One of 'auto', 'mps', 'cuda', 'cpu'
+                   'auto' will automatically select the best available device
+    
+    Returns:
+        torch.device: The selected device
+    
+    Raises:
+        ValueError: If device_str is not one of the supported values
+    """
+    supported_devices = {'auto', 'mps', 'cuda', 'cpu'}
+    if device_str not in supported_devices:
+        raise ValueError(f"device must be one of {supported_devices}, got '{device_str}'")
+    
+    if device_str == 'auto':
+        if torch.backends.mps.is_available():
+            return torch.device('mps')
+        elif torch.cuda.is_available():
+            return torch.device('cuda')
+        else:
+            return torch.device('cpu')
+    else:
+        return torch.device(device_str)
 
 # helpers
 
@@ -319,14 +347,16 @@ class Imagine(nn.Module):
         ema_decay = 0.99,
         num_cutouts = 128,
         center_bias = False,
-        larger_clip = False
+        larger_clip = False,
+        device = 'auto'
     ):
         super().__init__()
 
         if torch_deterministic:
             assert not bilinear, 'the deterministic (seeded) operation does not work with interpolation (PyTorch 1.7.1)'
-            torch.set_deterministic(True)
+            torch.use_deterministic_algorithms(True)
 
+        self.device = get_device(device)
         self.seed = seed
         self.append_seed = append_seed
 
@@ -349,7 +379,7 @@ class Imagine(nn.Module):
             num_cutouts = num_cutouts,
             center_bias = center_bias,
             larger_clip = larger_clip
-        ).cuda()
+        ).to(self.device)
 
         self.model = model
 
@@ -386,7 +416,7 @@ class Imagine(nn.Module):
         self.text = text
         self.img = img
         if encoding is not None:
-            encoding = encoding.cuda()
+            encoding = encoding.to(self.device)
         #elif self.create_story:
         #    encoding = self.update_story_encoding(epoch=0, iteration=1)
         elif text is not None and img is not None:
@@ -398,7 +428,7 @@ class Imagine(nn.Module):
         return encoding
 
     def create_text_encoding(self, text):
-        tokenized_text = tokenize(text).cuda()
+        tokenized_text = tokenize(text).to(self.device)
         with torch.no_grad():
             text_encoding = self.model.perceptor.encode_text(tokenized_text).detach()
         return text_encoding
@@ -406,7 +436,7 @@ class Imagine(nn.Module):
     def create_img_encoding(self, img):
         if isinstance(img, str):
             img = Image.open(img)
-        normed_img = self.clip_transform(img).unsqueeze(0).cuda()
+        normed_img = self.clip_transform(img).unsqueeze(0).to(self.device)
         with torch.no_grad():
             img_encoding = self.model.perceptor.encode_image(normed_img).detach()
         return img_encoding
@@ -440,7 +470,7 @@ class Imagine(nn.Module):
 
     def reset(self):
         self.model.reset()
-        self.model = self.model.cuda()
+        self.model = self.model.to(self.device)
         self.optimizer = Adam(self.model.model.latents.parameters(), self.lr)
 
     def train_step(self, epoch, i, pbar=None):
