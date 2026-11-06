@@ -14,10 +14,24 @@ Tags smaller than --min-size on either side (spacers, tracking pixels) are skipp
 import argparse
 import hashlib
 import json
+import random
 import re
 from collections import Counter
 from html.parser import HTMLParser
 from pathlib import Path
+
+# For --default-size random: width and height drawn independently from common web
+# image sizes (aspect kept within 3:1), seeded by the tag id so reruns give the same size.
+COMMON_SIDES = [100, 150, 200, 240, 250, 300, 320, 350, 400, 450, 500, 512, 600, 640, 800]
+
+
+def random_size(tag_id):
+    rng = random.Random(tag_id)
+    while True:
+        w, h = rng.choice(COMMON_SIDES), rng.choice(COMMON_SIDES)
+        if max(w, h) / min(w, h) <= 3:
+            return w, h
+
 
 PX = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(px)?\s*$", re.I)
 
@@ -65,10 +79,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("pages")
     ap.add_argument("out")
-    ap.add_argument("--default-size", default="512x512", help="for tags with no size at all")
+    ap.add_argument("--default-size", default="512x512",
+                    help="for tags with no size at all: WxH, or 'random' (independent common widths/heights)")
     ap.add_argument("--min-size", type=int, default=8)
     args = ap.parse_args()
-    dw, dh = map(int, args.default_size.lower().split("x"))
+    rand_default = args.default_size == "random"
+    dw, dh = (512, 512) if rand_default else map(int, args.default_size.lower().split("x"))
 
     items, skipped, sources = [], Counter(), Counter()
     for page in sorted(Path(args.pages).glob("*.html")):
@@ -77,6 +93,7 @@ def main():
         p = ImgCollector()
         p.feed(html)
         for idx, (a, raw, line) in enumerate(p.imgs):
+            tag_id = hashlib.sha1(f"{page.name}\0{idx}".encode()).hexdigest()[:12]
             w = px(a.get("width")) or style_px(a.get("style"), "width")
             h = px(a.get("height")) or style_px(a.get("style"), "height")
             src = "attrs"
@@ -88,16 +105,18 @@ def main():
                 w = h = w or h
                 src = "one_side" if src == "attrs" else src
             else:
-                w, h, src = dw, dh, "default"
-                if css.get("max-width") and css["max-width"] < w:
-                    w = h = css["max-width"]
+                w, h = random_size(tag_id) if rand_default else (dw, dh)
+                src = "default"
+                cap = css.get("max-width")
+                if cap and cap < w:  # shrink to the page's img max-width, keeping the shape
+                    w, h = cap, max(1, round(h * cap / w))
                     src = "default_capped"
             if min(w, h) < args.min_size:
                 skipped["too_small"] += 1
                 continue
             sources[src] += 1
             items.append({
-                "id": hashlib.sha1(f"{page.name}\0{idx}".encode()).hexdigest()[:12],
+                "id": tag_id,
                 "page": page.name, "index": idx, "line": line,
                 "width": w, "height": h, "size_source": src,
                 "src": a.get("src"), "alt": a.get("alt"), "tag": raw,
