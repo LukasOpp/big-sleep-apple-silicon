@@ -7,6 +7,9 @@ Every image gets its own random:
   - "anti-ImageNet" settings: banned BigGAN classes, a negative prompt, and a
     weaker one-class penalty so BigGAN can mix classes into in-between things
 
+With --alpha, some images also get a transparency mask made by the model itself
+(see "alpha" below), saved as RGBA.
+
 Writes NNNNN.png plus NNNNN.json (prompt and every setting) into --out.
 Images that already exist are skipped, so a restart resumes where it stopped.
 
@@ -190,6 +193,8 @@ def patch_big_sleep():
             self.seed_extra = torch.nn.Parameter(torch.randn(n, self.normu.shape[1]))
         else:
             self.seed_extra = None
+        if ALPHA["on"]:
+            self.alpha_bias = torch.nn.Parameter(torch.zeros(1))
 
     def grid_biggan(biggan, z, cls, extra):
         embed = biggan.embeddings(cls)
@@ -210,21 +215,31 @@ def patch_big_sleep():
             x = F.interpolate(x, size=(gh, gw), mode="bilinear", align_corners=True)
         x = x.contiguous()
         i = 1
+        feat = None
         for layer in g.layers:
             if isinstance(layer, GenBlock):
                 x = layer(x, cond[i].unsqueeze(0), 1)
+                if ALPHA["on"] and i - 1 == ALPHA["block"]:  # tap this block for the mask
+                    feat = x[:, [c % x.shape[1] for c in ALPHA["channels"]]]
                 i += 1
             else:
                 x = layer(x)
         x = g.conv_to_rgb(g.relu(g.bn(x, 1)))[:, :3]
-        return torch.tanh(x)
+        return torch.tanh(x), feat
 
     def model_forward(self):
         self.biggan.eval()
         normu, classes = self.latents()
         src = self.latents.model if self.latents.training else self.latents.average
-        out = grid_biggan(self.biggan, normu, classes, getattr(src, "seed_extra", None))
-        return (out + 1) / 2
+        rgb, feat = grid_biggan(self.biggan, normu, classes, getattr(src, "seed_extra", None))
+        rgb = (rgb + 1) / 2
+        LAST.clear()
+        LAST["rgb"] = rgb
+        if not ALPHA["on"]:
+            return rgb
+        alpha = alpha_from_features(feat, src.alpha_bias, rgb.shape[-2:])
+        LAST["alpha"] = alpha
+        return rgb * alpha + random_background(rgb) * (1 - alpha)
 
     def rand_cutout(image, size, center_bias=False, center_focus=2):
         h, w = image.shape[-2:]
@@ -239,6 +254,87 @@ def patch_big_sleep():
     bs.Latents.__init__ = latents_init
     bs.Model.forward = model_forward
     bs.rand_cutout = rand_cutout
+
+
+# ------------------------------------------------------------------ alpha ----
+#
+# The mask is a trained neuron's activation map. BigGAN-deep is a stack of 14
+# residual blocks; alpha = 1-2 channels (random signs) of one block's output,
+# picked per image. Deeper in = finer detail:
+#   block 6  -> 1/16 of the output res (32px for 512): big continents
+#   block 8  -> 1/8   (64px):  bold shapes
+#   block 10 -> 1/4  (128px):  shapes with frayed / feathery edges
+# The logit is standardised, upsampled bilinearly (smooth curves, plus the grid
+# character of the feature map), + a learnable offset, through a sigmoid whose
+# hardness is annealed from soft (so the optimiser can move the shape) to a cut
+# at the end. No post-processing: the saved edge is the model's.
+#
+# During optimisation CLIP sees the image composited over a fresh random
+# background each step (flat colour / noise / blotches), so only the opaque part
+# can carry the prompt: the shape gets carved around whatever CLIP latched onto.
+# Losses keep the opaque area near a target share, push alpha to 0/1, and
+# optionally keep the border clear so the shape floats in the canvas.
+
+ALPHA = {"on": False}  # set per image: block, channels, signs, gain (annealed in render)
+LAST = {}              # latest rgb / alpha from the forward pass
+ALPHA_BLOCKS = {6: "1/16", 8: "1/8", 10: "1/4"}  # 12 (1/2 res) is too grainy
+
+
+def random_background(like):
+    import torch
+    import torch.nn.functional as F
+    b, _, h, w = like.shape
+    kind = random.random()
+    if kind < 0.4:
+        return torch.rand(b, 3, 1, 1, device=like.device).expand(b, 3, h, w)
+    if kind < 0.7:
+        return torch.rand(b, 3, h, w, device=like.device)
+    small = torch.rand(b, 3, random.randint(2, 8), random.randint(2, 8), device=like.device)
+    return F.interpolate(small, size=(h, w), mode="bicubic", align_corners=False).clamp(0, 1)
+
+
+def alpha_from_features(feat, bias, size):
+    import torch
+    import torch.nn.functional as F
+    signs = torch.tensor(ALPHA["signs"], device=feat.device, dtype=feat.dtype).view(1, -1, 1, 1)
+    logit = (feat * signs).sum(1, keepdim=True)
+    logit = (logit - logit.mean()) / (logit.std() + 1e-5)
+    logit = F.interpolate(logit, size=size, mode="bilinear", align_corners=False)
+    return torch.sigmoid(ALPHA["gain"] * (logit + bias))
+
+
+def alpha_losses(s, alpha):
+    """Extra loss terms for the mask: coverage band, 0/1, clear border."""
+    import torch
+    cov = alpha.mean()
+    c = s["alpha"]["coverage"]
+    loss = 10 * (torch.relu(cov - (c + 0.1)) + torch.relu((c - 0.1) - cov))
+    loss = loss + 0.5 * (alpha * (1 - alpha)).mean()
+    if s["alpha"]["float"]:
+        h, w = alpha.shape[-2:]
+        m = max(2, round(0.04 * min(h, w)))
+        border = torch.cat([alpha[..., :m, :].flatten(), alpha[..., -m:, :].flatten(),
+                            alpha[..., :, :m].flatten(), alpha[..., :, -m:].flatten()])
+        loss = loss + 2 * border.mean()
+    return loss
+
+
+def alpha_gain(s, step, steps):
+    """Sigmoid hardness: 2 (soft, movable) -> gain_end (a cut) over the run."""
+    g1 = s["alpha"]["gain_end"]
+    return 2.0 * (g1 / 2.0) ** (step / max(1, steps - 1))
+
+
+def sample_alpha(rng):
+    k = rng.choice([1, 1, 2])
+    return {
+        "block": rng.choices(list(ALPHA_BLOCKS), weights=[4, 4, 2])[0],
+        "channels": rng.sample(range(4096), k),         # taken modulo the block's channel count
+        "signs": [rng.choice([1, -1]) for _ in range(k)],
+        "gain_end": rng.choice([25.0, 50.0, 100.0]),    # final edge hardness
+        "coverage": round(rng.uniform(0.25, 0.75), 3),  # target opaque share
+        "float": rng.random() < 0.7,                    # keep edges transparent
+    }
 
 
 # ------------------------------------------------------------- generation ----
@@ -272,6 +368,10 @@ def render(im, s, path):
 
     gh, gw = s["grid"]
     GRID.update(gh=gh, gw=gw, fill=s["fill"])
+    ALPHA.clear()
+    ALPHA["on"] = bool(s.get("alpha"))
+    if ALPHA["on"]:
+        ALPHA.update(s["alpha"])
     torch.manual_seed(s["seed"])
     random.seed(s["seed"])
     im.reset()  # builds fresh latents (incl. extra tile seeds) for this grid
@@ -290,12 +390,16 @@ def render(im, s, path):
     negs = [im.create_text_encoding(t) for t in s["negative"].split("|")] if s["negative"] else []
     apply_ban()
 
-    for _ in range(s["iterations"]):
+    for step in range(s["iterations"]):
+        if ALPHA["on"]:
+            ALPHA["gain"] = alpha_gain(s, step, s["iterations"])
         _, (lat_loss, cls_loss, sim_loss) = im.model(target, negs)
         loss = lat_loss + s["class_loss_weight"] * cls_loss + sim_loss
         extra = latents.model.seed_extra
         if extra is not None:  # keep tile seeds ~N(0,1) like big_sleep does for the main one
             loss = loss + (torch.abs(1 - extra.std(dim=1)) + torch.abs(extra.mean(dim=1))).mean()
+        if ALPHA["on"]:
+            loss = loss + alpha_losses(s, LAST["alpha"])
         loss.backward()
         im.optimizer.step()
         latents.update()
@@ -304,12 +408,15 @@ def render(im, s, path):
 
     with torch.no_grad():
         latents.eval()
-        _, losses = im.model(target, negs)
-        best = torch.topk(losses[2], k=1, largest=False)[1]
-        image = im.model.model()[best].cpu()
+        if ALPHA["on"]:
+            ALPHA["gain"] = s["alpha"]["gain_end"]
+        im.model.model()  # fills LAST with the EMA latents' rgb (+ alpha)
+        image = LAST["rgb"][0]
+        if ALPHA["on"]:
+            image = torch.cat([image, LAST["alpha"][0]], dim=0)  # RGBA
+        image = image.cpu()
         latents.train()
-    image = image.reshape(-1, *image.shape[-3:])[0].clamp(0, 1)
-    img = to_pil_image(image)
+    img = to_pil_image(image.clamp(0, 1))
     # center-crop to the canvas aspect (grid is within half a cell of it), then resize
     W, H = s["canvas"]
     w, h = img.size
@@ -337,6 +444,8 @@ def main():
     ap.add_argument("--manifest", help="JSON list of {id, width, height, alt?} (extract_img_manifest.py); "
                                        "one image per entry, saved as <id>.png; overrides --count/--canvas")
     ap.add_argument("--scale", type=float, default=1.0, help="manifest sizes x this (2 = retina)")
+    ap.add_argument("--alpha", type=float, default=0.0,
+                    help="share of images (0..1) that get a model-made transparency mask (RGBA png)")
     ap.add_argument("--prompt-source", choices=["garbage", "alt", "mix"], default="garbage",
                     help="alt: use the manifest's alt text when there is one; mix: half of those")
     args = ap.parse_args()
@@ -367,6 +476,8 @@ def main():
         s.update(crispness=round(t, 3), iterations=round(50 * 20 ** t), num_cutouts=round(8 * 16 ** t))
         gh, gw = plan_grid(W, H, args.detail)
         multi_block = gh > 4 or gw > 4
+        arng = random.Random(args.run_seed * 31_337 + i)  # own stream: other settings unchanged
+        s["alpha"] = sample_alpha(arng) if arng.random() < args.alpha else None
         s.update(canvas=[W, H], grid=[gh, gw],
                  fill=crng.choice(["stretch", "tiles"]) if multi_block else "stretch")
         return s
@@ -376,7 +487,9 @@ def main():
             s = settings_for(i)
             print(f"{i:05d} {s['canvas'][0]}x{s['canvas'][1]} grid={s['grid'][0]}x{s['grid'][1]} {s['fill']:7s} "
                   f"t={s['crispness']:.2f} {s['mode']:7s} ban={s['class_ban']:10s} "
-                  f"clsw={s['class_loss_weight']:<4} neg={'y' if s['negative'] else 'n'}  {s['texts']}")
+                  f"clsw={s['class_loss_weight']:<4} neg={'y' if s['negative'] else 'n'} "
+                  f"alpha={'n' if not s['alpha'] else 'b%d cov%.2f' % (s['alpha']['block'], s['alpha']['coverage'])}  "
+                  f"{s['texts']}")
         return
 
     patch_big_sleep()

@@ -30,6 +30,8 @@
 #                  (use the same MANIFEST and DEST_DIR on all of them)
 #   SCALE          manifest sizes x this (default 1; 2 = retina)
 #   PROMPTS        garbage | alt | mix   (alt = use the tag's alt text when it has one; default garbage)
+#   ALPHA          share of images (0..1) that get a transparency mask read out of one of BigGAN's
+#                  internal feature maps; those are saved as RGBA png (default 0)
 #   CANVAS         output size: 1920x1080 | a comma list to pick from per image | random   (default 512x512)
 #   DETAIL         128px cells on the short side before resizing to CANVAS (default 4 = 512px;
 #                  time and VRAM grow with the cell count; use WORKERS=1 for big grids)
@@ -168,7 +170,7 @@ for ((w = 0; w < WORKERS; w++)); do
   timeout "${MAX_HOURS}h" python -u /workspace/generate.py --count "$COUNT" --out "$OUT" \
     --worker "$(( (SHARD_K - 1) * WORKERS + w ))" --workers "$(( SHARD_N * WORKERS ))" --run-seed "$RUN_SEED" \
     --canvas "${CANVAS:-512x512}" --detail "${DETAIL:-4}" \
-    --prompt-source "${PROMPTS:-garbage}" "${MANIFEST_ARGS[@]}" &
+    --prompt-source "${PROMPTS:-garbage}" --alpha "${ALPHA:-0}" "${MANIFEST_ARGS[@]}" &
   pids+=($!)
 done
 fail=0
